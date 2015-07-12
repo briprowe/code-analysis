@@ -1,39 +1,99 @@
 (ns code-analysis.core
   (:require [datomic.api :as d :refer [q]]
-            [kibit.check :as k]
-            [clojure.tools.reader.edn :as edn]))
+            [kibit.check :refer [all-rules]]
+            [kibit.core :as k]
+            [clojure.walk :as walk]
+            [clojure.tools.reader :as rdr]))
 
 (def connection (d/connect "datomic:free://localhost:4334/message-api"))
 (def db (d/db connection))
+
+(def rules
+ '[[(node-files ?n ?f) [?n :node/object ?f] [?f :git/type :blob]]
+   [(node-files ?n ?f) [?n :node/object ?t] [?t :git/type :tree]
+                       [?t :tree/nodes ?n2] (node-files ?n2 ?f)]
+   [(object-nodes ?o ?n) [?n :node/object ?o]]
+   [(object-nodes ?o ?n) [?n2 :node/object ?o] [?t :tree/nodes ?n2] (object-nodes ?t ?n)]
+   [(commit-files ?c ?f) [?c :commit/tree ?root] (node-files ?root ?f)]
+   [(commit-codeqs ?c ?cq) (commit-files ?c ?f) [?cq :codeq/file ?f]]
+   [(file-commits ?f ?c) (object-nodes ?f ?n) [?c :commit/tree ?n]]
+   [(codeq-commits ?cq ?c) [?cq :codeq/file ?f] (file-commits ?f ?c)]])
 
 (def sha "8d15e962510e5812618893bb80dd457f5d190525")
 
 (def commit (d/touch (d/entity db 17592186066529)))
 
+(defn codeqs
+  [db]
+  (->> (q '[:find ?codeq
+            :where
+            [?codeq :codeq/code]]
+          db)
+       (map first)
+       (map (partial d/entity db))))
 
-(defmulti find-files :git/type)
+(defn simplify
+  [rules expr]
+  (->> expr
+       (iterate (partial walk/prewalk #(k/simplify-one % rules)))
+       (partition 2 1)
+       (take-while #(apply not= %))))
 
-(defmethod find-files :commit
-  [commit]
-  (flatten (find-files (get-in commit [:commit/tree :node/object]))))
+(def read-codeq (comp rdr/read-string #(get-in % [:codeq/code :code/text])))
 
-(defmethod find-files :tree
-  [tree-node]
-  (map (comp find-files :node/object) (:tree/nodes tree-node)))
+(defn analyze
+  [codeq]
+  (let [simplifications (simplify all-rules (read-codeq codeq))]
+    {:codeq codeq
+     :simplifications simplifications
+     :kibit-quality (count simplifications)}))
 
-(defmethod find-files :blob
-  [blob-object]
-  blob-object)
+(defn codeq->node-object
+  [codeq]
+  (-> (get-in codeq [:codeq/file :node/_object])
+      first))
 
+(defn codeq->commit
+  [codeq]
+  (q '[:find [[pull ?commit [:commit/message
+                             :git/sha
+                             {:commit/author [:email/address]}
+                             :commit/authoredAt]] ...]
+       :in $ % ?codeq
+       :where
+       (codeq-commits ?codeq ?commit)]
+     (d/entity-db codeq) rules
+     (:db/id codeq)))
 
-(def analysis
-  (k/check-expr
-   (edn/read-string
-    (ffirst (q '[:find ?code-text
-                 :where
-                 [?file :git/type :blob]
-                 [?codeq :codeq/file ?file]
-                 [?codeq :codeq/code ?code]
-                 [?code :code/text ?code-text]]
-               db)))))
+(defn codeq->paths
+  [codeq]
+  (->> (:node/paths (codeq->node-object codeq))
+       (map :file/name)))
 
+(defn ->location
+  [codeq]
+  (merge {:path (.replaceFirst (first (codeq->paths codeq)) "message-api/" "")}
+         (->> (re-seq #"\d+" (:codeq/loc codeq))
+              (map #(Long/parseLong %))
+              (zipmap [:start-line :start-col :end-line :end-col]))))
+
+(defn ->url
+  [sha {:keys [path start-line end-line]}]
+  (format "https://github.com/rentpath/message-api/blob/%s/%s#L%d-%d"
+          sha path start-line end-line))
+
+(defn analysis->report
+  [{:keys [codeq] :as analysis}]
+  (let [commit (first (sort-by :commit/authoredAt (codeq->commit codeq)))
+        location (->location codeq)]
+    {:sha (get-in codeq [:codeq/file :git/sha])
+     :url (->url (:git/sha commit) location)
+     :filename (first (codeq->paths codeq))
+     :author (get-in commit [:commit/author :email/address])
+     :code-location (:start-line location)
+     :kibit-quality (:kibit-quality analysis)}))
+
+(defn print-report
+  [analysis]
+  (->> (map analysis->report analysis)
+       clojure.pprint/print-table))
