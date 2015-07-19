@@ -21,16 +21,24 @@
 
 (def sha "8d15e962510e5812618893bb80dd457f5d190525")
 
-(def commit (d/touch (d/entity db 17592186066529)))
+;; (defn codeqs
+;;   [db]
+;;   (->> (q '[:find (sample 10 ?codeq) .
+;;             :where
+;;             [?codeq :codeq/code]]
+;;           db)
+;;        ;; (map first)
+;;        (map (partial d/entity db))
+;;        ))
 
 (defn codeqs
   [db]
-  (->> (q '[:find ?codeq
+  (->> (q '[:find ?commit ?codeq
+            :in $ %
             :where
-            [?codeq :codeq/code]]
-          db)
-       (map first)
-       (map (partial d/entity db))))
+            [?commit :git/type :commit]
+            (commit-codeqs ?commit ?codeq)]
+          db rules)))
 
 (defn simplify
   [rules expr]
@@ -55,10 +63,10 @@
 
 (defn codeq->commit
   [codeq]
-  (q '[:find [[pull ?commit [:commit/message
+  (q '[:find [(pull ?commit [:commit/message
                              :git/sha
                              {:commit/author [:email/address]}
-                             :commit/authoredAt]] ...]
+                             :commit/authoredAt])]
        :in $ % ?codeq
        :where
        (codeq-commits ?codeq ?commit)]
@@ -84,16 +92,23 @@
 
 (defn analysis->report
   [{:keys [codeq] :as analysis}]
-  (let [commit (first (sort-by :commit/authoredAt (codeq->commit codeq)))
+  (let [commit (first (sort-by :commit/authoredAt (comp - compare) (codeq->commit codeq)))
         location (->location codeq)]
-    {:sha (get-in codeq [:codeq/file :git/sha])
+    {;; :sha (get-in codeq [:codeq/file :git/sha])
      :url (->url (:git/sha commit) location)
-     :filename (first (codeq->paths codeq))
      :author (get-in commit [:commit/author :email/address])
-     :code-location (:start-line location)
      :kibit-quality (:kibit-quality analysis)}))
 
 (defn print-report
   [analysis]
   (->> (map analysis->report analysis)
        clojure.pprint/print-table))
+
+(comment
+  (require '[clojure.java.io :as io])
+  
+  (with-open [output-writer (io/writer "analysis.txt")]
+    (binding [*out* output-writer]
+      (->> (codeqs db) (pmap analyze) print-report)))
+
+  )
