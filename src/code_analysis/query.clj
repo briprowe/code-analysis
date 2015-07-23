@@ -51,3 +51,46 @@
               (query-result->codeq db)
               (remove (comp parent-shas codeq-sha)))
           (commit-codeq db commit-sha))))
+
+(defn codeq->commit
+  [codeq]
+  (q '[:find [(pull ?commit [:commit/message
+                             :git/sha
+                             {:commit/author [:email/address]}
+                             :commit/authoredAt])]
+       :in $ % ?codeq
+       :where
+       (codeq-commits ?codeq ?commit)]
+     (d/entity-db codeq) rules
+     (:db/id codeq)))
+
+(defn analysis->transaction
+  [{:keys [codeq simplifications kibit-quality] :as analysis}]
+  (let [analysis-id (d/tempid :db.part/user)]
+    [[:db/add analysis-id :analysis/codeq (:db/id codeq)]
+     [:db/add analysis-id :analysis/simplifications (pr-str simplifications)]
+     [:db/add analysis-id :analysis/kibit-quality kibit-quality]]))
+
+(defn store-analysis
+  [conn analysis]
+  (->> analysis
+       (into [] (mapcat analysis->transaction))
+       (d/transact conn)))
+
+(comment
+  (do
+    (require 'code-analysis.core)
+    (require 'code-analysis.analyze)
+    (require 'code-analysis.report)
+
+    @(->> (commit->codeq (d/db code-analysis.core/connection)
+                         "982109e01bf00454282c4ee6a805610738be04a1")
+          (map code-analysis.analyze/analyze)
+          (store-analysis code-analysis.core/connection)))
+
+  (q '[:find ?analysis
+       :where
+       [?analysis :analysis/codeq _]]
+     (d/db code-analysis.core/connection))
+
+  )
